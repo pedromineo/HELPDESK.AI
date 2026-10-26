@@ -334,8 +334,27 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[Startup] AutoCloseService background task not started: {e}")
 
+    sla_task = None
+    try:
+        from backend.services.sla_escalation_service import run_sla_sweep
+
+        async def _run_sla_sweep_loop():
+            while True:
+                try:
+                    await asyncio.to_thread(run_sla_sweep, supabase)
+                except Exception as ex:
+                    print(f"[SLA Sweep] Loop warning: {ex}")
+                await asyncio.sleep(int(os.environ.get("SLA_SWEEP_INTERVAL_SECONDS", "300")))
+
+        sla_task = asyncio.create_task(_run_sla_sweep_loop())
+        print("[Startup] SLA escalation worker started.")
+    except Exception as e:
+        print(f"[Startup] SLA escalation worker not started: {e}")
+
     yield
 
+    if sla_task:
+        sla_task.cancel()
     if auto_close_task:
         auto_close_task.cancel()
     print("[Shutdown] Cleaning up ...")
@@ -570,6 +589,18 @@ async def trigger_auto_close(authorization: str | None = Header(None)):
         return {"status": "success", "result": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/internal/sla/sweep")
+async def trigger_sla_sweep(authorization: str | None = Header(None)):
+    """Trigger an on-demand SLA escalation sweep (protected by INTERNAL_CRON_SECRET)."""
+    cron_secret = os.environ.get("INTERNAL_CRON_SECRET")
+    if not cron_secret or authorization != f"Bearer {cron_secret}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    from backend.services.sla_escalation_service import run_sla_sweep
+
+    result = await asyncio.to_thread(run_sla_sweep, supabase)
+    return {"status": "success", "result": result}
 
 
 class TroubleshootRequest(BaseModel):
